@@ -1,121 +1,408 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"github.com/gorilla/websocket"
 	"log"
 	"net/http"
+	"net/url"
+	"os"
+	"strings"
 	"sync"
-
-	"github.com/gorilla/websocket"
+	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
-// HTTP接続をWebSocket接続にアップグレードするための設定
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		// 開発時はすべてのオリジンを許可（本番時は適切なドメインに制限）
+type selection struct {
+	Name      string   `json:"name"`
+	Character string   `json:"character"`
+	Spells    []string `json:"spells"`
+}
+type command struct {
+	Type    string `json:"type"`
+	MatchID string `json:"matchId"`
+	selection
+}
+type player struct {
+	ID    string `json:"id"`
+	Team  string `json:"team"`
+	Ready bool   `json:"ready"`
+	selection
+}
+type match struct {
+	ID       string    `json:"id"`
+	Phase    string    `json:"phase"`
+	Players  [2]player `json:"players"`
+	Deadline int64     `json:"deadline"`
+}
+type session struct {
+	id          string
+	connections map[*client]bool
+	queued      bool
+	choice      selection
+	matchID     string
+	seen        time.Time
+}
+type client struct {
+	conn    *websocket.Conn
+	send    chan []byte
+	session *session
+}
+type lobby struct {
+	mu       sync.Mutex
+	sessions map[string]*session
+	matches  map[string]*match
+	queue    []*session
+}
+
+func newLobby() *lobby { return &lobby{sessions: map[string]*session{}, matches: map[string]*match{}} }
+func randomID() string {
+	var b [24]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(err)
+	}
+	return hex.EncodeToString(b[:])
+}
+func validSelection(s selection) bool {
+	if !utf8.ValidString(s.Name) || utf8.RuneCountInString(s.Name) < 1 || utf8.RuneCountInString(s.Name) > 16 {
+		return false
+	}
+	for _, c := range s.Name {
+		if unicode.IsControl(c) {
+			return false
+		}
+	}
+	switch s.Character {
+	case "Sophie", "Jude", "Nadia", "Chiyo":
+	default:
+		return false
+	}
+	if len(s.Spells) != 2 || s.Spells[0] == s.Spells[1] {
+		return false
+	}
+	for _, v := range s.Spells {
+		if v != "flash" && v != "ignite" && v != "barrier" {
+			return false
+		}
+	}
+	return true
+}
+func (l *lobby) originOK(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
 		return true
-	},
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	if u.Host == r.Host && (u.Scheme == "http" || u.Scheme == "https") {
+		return true
+	}
+	for _, allowed := range strings.Split(os.Getenv("ALLOWED_ORIGINS"), ",") {
+		if origin == strings.TrimSpace(allowed) {
+			return true
+		}
+	}
+	return false
+}
+func (l *lobby) handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/session", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(405)
+			return
+		}
+		if !l.originOK(r) {
+			http.Error(w, "origin forbidden", 403)
+			return
+		}
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		var token string
+		if c, err := r.Cookie("auxilia_moba_session"); err == nil {
+			token = c.Value
+		}
+		s := l.sessions[token]
+		if s == nil {
+			token = randomID()
+			s = &session{id: randomID(), connections: map[*client]bool{}}
+			l.sessions[token] = s
+		}
+		s.seen = time.Now()
+		http.SetCookie(w, &http.Cookie{Name: "auxilia_moba_session", Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: r.TLS != nil, MaxAge: 86400})
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		json.NewEncoder(w).Encode(map[string]string{"id": s.id})
+	})
+	mux.HandleFunc("/ws", l.serveWS)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
+	return mux
 }
 
-// 接続中のクライアントを管理する構造体（簡易版）
-type Client struct {
-	conn *websocket.Conn
-	send chan []byte
-}
-
-type Room struct {
-	clients    map[*Client]bool
-	broadcast  chan []byte
-	register   chan *Client
-	unregister chan *Client
-	mu         sync.Mutex
-}
-
-func newRoom() *Room {
-	return &Room{
-		clients:    make(map[*Client]bool),
-		broadcast:  make(chan []byte),
-		register:   make(chan *Client),
-		unregister: make(chan *Client),
+// All mutations and broadcasts share a lock, including queue/cancel races.
+func (l *lobby) emit(c *client, v any) {
+	b, _ := json.Marshal(v)
+	select {
+	case c.send <- b:
+	default:
+		c.conn.Close()
 	}
 }
-
-func (r *Room) run() {
-	for {
-		select {
-		case client := <-r.register:
-			r.mu.Lock()
-			r.clients[client] = true
-			r.mu.Unlock()
-			log.Println("New client connected")
-		case client := <-r.unregister:
-			r.mu.Lock()
-			if _, ok := r.clients[client]; ok {
-				delete(r.clients, client)
-				close(client.send)
-				log.Println("Client disconnected")
-			}
-			r.mu.Unlock()
-		case message := <-r.broadcast:
-			r.mu.Lock()
-			for client := range r.clients {
-				select {
-				case client.send <- message:
-				default:
-					close(client.send)
-					delete(r.clients, client)
-				}
-			}
-			r.mu.Unlock()
+func (l *lobby) active() int {
+	n := 0
+	for _, s := range l.sessions {
+		if len(s.connections) > 0 {
+			n++
+		}
+	}
+	return n
+}
+func (l *lobby) state(s *session, notice string) {
+	phase := "entrance"
+	if s.queued {
+		phase = "queued"
+	}
+	m := l.matches[s.matchID]
+	if m != nil {
+		phase = m.Phase
+	}
+	for c := range s.connections {
+		l.emit(c, map[string]any{"type": "state", "selfId": s.id, "phase": phase, "selection": s.choice, "match": m, "notice": notice})
+	}
+}
+func (l *lobby) presence() {
+	n := l.active()
+	for _, s := range l.sessions {
+		for c := range s.connections {
+			l.emit(c, map[string]any{"type": "presence", "active": n})
 		}
 	}
 }
-
-func serveWs(room *Room, w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Println("Upgrade error:", err)
+func (l *lobby) removeQueue(s *session) {
+	s.queued = false
+	for i, v := range l.queue {
+		if v == s {
+			l.queue = append(l.queue[:i], l.queue[i+1:]...)
+			break
+		}
+	}
+}
+func (l *lobby) matchState(m *match) {
+	for _, s := range l.sessions {
+		if s.matchID == m.ID {
+			l.state(s, "")
+		}
+	}
+}
+func (l *lobby) finish(m *match, notice string) {
+	delete(l.matches, m.ID)
+	for _, s := range l.sessions {
+		if s.matchID == m.ID {
+			s.matchID = ""
+			l.state(s, notice)
+		}
+	}
+}
+func (l *lobby) handle(c *client, cmd command, now time.Time) {
+	s := c.session
+	s.seen = now
+	fail := func(message string) { l.emit(c, map[string]string{"type": "error", "message": message}) }
+	switch cmd.Type {
+	case "queue":
+		if s.queued || s.matchID != "" {
+			l.state(s, "")
+			return
+		}
+		cmd.Name = strings.TrimSpace(cmd.Name)
+		if !validSelection(cmd.selection) {
+			fail("名前・キャラクター・異なる2つのスペルを確認してください。")
+			return
+		}
+		s.choice = cmd.selection
+		s.queued = true
+		l.queue = append(l.queue, s)
+		l.state(s, "")
+		if len(l.queue) >= 2 {
+			a, b := l.queue[0], l.queue[1]
+			l.queue = l.queue[2:]
+			a.queued = false
+			b.queued = false
+			var coin [1]byte
+			if _, err := rand.Read(coin[:]); err != nil {
+				panic(err)
+			}
+			if coin[0]&1 == 1 {
+				a, b = b, a
+			}
+			m := &match{ID: randomID(), Phase: "loading", Deadline: now.Add(30 * time.Second).UnixMilli(), Players: [2]player{{ID: a.id, Team: "blue", selection: a.choice}, {ID: b.id, Team: "red", selection: b.choice}}}
+			l.matches[m.ID] = m
+			a.matchID = m.ID
+			b.matchID = m.ID
+			l.matchState(m)
+		}
+	case "cancel":
+		if s.matchID != "" {
+			fail("先にマッチングが成立しました。退出する場合は成立画面から戻ってください。")
+			l.state(s, "")
+			return
+		}
+		l.removeQueue(s)
+		l.state(s, "")
+	case "ready", "leave":
+		m := l.matches[s.matchID]
+		if m == nil || cmd.MatchID != m.ID {
+			fail("現在のマッチが見つかりません。")
+			return
+		}
+		if cmd.Type == "leave" {
+			l.finish(m, "プレイヤーが退出したため、マッチを終了しました。")
+			return
+		}
+		if m.Phase != "loading" {
+			l.state(s, "")
+			return
+		}
+		if now.UnixMilli() >= m.Deadline {
+			l.finish(m, "準備が30秒以内に完了しなかったため、マッチを無効にしました。")
+			return
+		}
+		for i := range m.Players {
+			if m.Players[i].ID == s.id {
+				m.Players[i].Ready = true
+			}
+		}
+		if m.Players[0].Ready && m.Players[1].Ready {
+			m.Phase = "countdown"
+			m.Deadline = now.Add(3 * time.Second).UnixMilli()
+		}
+		l.matchState(m)
+	default:
+		fail("未対応の操作です。")
+	}
+}
+func (l *lobby) tick(now time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, m := range l.matches {
+		if now.UnixMilli() < m.Deadline {
+			continue
+		}
+		switch m.Phase {
+		case "loading":
+			l.finish(m, "準備が30秒以内に完了しなかったため、マッチを無効にしました。")
+		case "countdown":
+			m.Phase = "ready"
+			m.Deadline = now.Add(5 * time.Minute).UnixMilli()
+			l.matchState(m)
+		case "ready":
+			l.finish(m, "対戦準備画面の保持時間が終了しました。")
+		}
+	}
+	for token, s := range l.sessions {
+		if len(s.connections) == 0 && s.matchID == "" && now.Sub(s.seen) > 5*time.Minute {
+			delete(l.sessions, token)
+		}
+	}
+}
+func (l *lobby) serveWS(w http.ResponseWriter, r *http.Request) {
+	l.mu.Lock()
+	cookie, err := r.Cookie("auxilia_moba_session")
+	if err != nil || l.sessions[cookie.Value] == nil {
+		l.mu.Unlock()
+		http.Error(w, "session required", 401)
 		return
 	}
-	client := &Client{conn: conn, send: make(chan []byte, 256)}
-	room.register <- client
-
-	// クライアントからの受信ループ
-	go func() {
-		defer func() {
-			room.unregister <- client
-			conn.Close()
-		}()
-		for {
-			_, message, err := conn.ReadMessage()
-			if err != nil {
-				break
-			}
-			// 受信した操作入力などをルーム全体にブロードキャスト
-			room.broadcast <- message
-		}
-	}()
-
-	// クライアントへの送信ループ
-	go func() {
-		defer conn.Close()
-		for message := range client.send {
-			if err := conn.WriteMessage(websocket.TextMessage, message); err != nil {
-				break
-			}
-		}
-	}()
-}
-
-func main() {
-	room := newRoom()
-	go room.run()
-
-	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		serveWs(room, w, r)
-	})
-
-	log.Println("MOBA WebSocket server starting on :8080...")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
-		log.Fatal("ListenAndServe error:", err)
+	s := l.sessions[cookie.Value]
+	upgrader := websocket.Upgrader{CheckOrigin: l.originOK, HandshakeTimeout: 5 * time.Second}
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		l.mu.Unlock()
+		return
 	}
+	c := &client{conn: conn, send: make(chan []byte, 64), session: s}
+	s.connections[c] = true
+	s.seen = time.Now()
+	l.state(s, "")
+	l.presence()
+	l.mu.Unlock()
+	defer func() {
+		conn.Close()
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		delete(s.connections, c)
+		close(c.send)
+		s.seen = time.Now()
+		if len(s.connections) == 0 {
+			l.removeQueue(s)
+			if m := l.matches[s.matchID]; m != nil {
+				l.finish(m, "相手との接続が切れたため、マッチを無効にしました。")
+			}
+		}
+		l.presence()
+	}()
+	go func() {
+		ping := time.NewTicker(5 * time.Second)
+		defer ping.Stop()
+		defer conn.Close()
+		for {
+			select {
+			case b, ok := <-c.send:
+				if !ok {
+					return
+				}
+				conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+				if conn.WriteMessage(websocket.TextMessage, b) != nil {
+					return
+				}
+			case <-ping.C:
+				if conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second)) != nil {
+					return
+				}
+			}
+		}
+	}()
+	conn.SetReadLimit(4096)
+	conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+	conn.SetPongHandler(func(string) error { return conn.SetReadDeadline(time.Now().Add(15 * time.Second)) })
+	window := time.Now()
+	count := 0
+	for {
+		var cmd command
+		if err := conn.ReadJSON(&cmd); err != nil {
+			return
+		}
+		now := time.Now()
+		if now.Sub(window) >= time.Second {
+			window = now
+			count = 0
+		}
+		count++
+		if count > 60 {
+			return
+		}
+		l.mu.Lock()
+		l.handle(c, cmd, now)
+		l.mu.Unlock()
+	}
+}
+func main() {
+	l := newLobby()
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for now := range ticker.C {
+			l.tick(now)
+		}
+	}()
+	address := os.Getenv("ADDR")
+	if address == "" {
+		address = ":8080"
+	}
+	log.Printf("League of Auxilia lobby listening on %s", address)
+	server := &http.Server{Addr: address, Handler: l.handler(), ReadHeaderTimeout: 5 * time.Second}
+	log.Fatal(server.ListenAndServe())
 }
