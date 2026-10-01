@@ -108,8 +108,8 @@ func TestMatchLifecycleAndIsolation(t *testing.T) {
 	}
 	f.l.mu.Unlock()
 	f.l.tick(time.UnixMilli(countdown.Match.Deadline))
-	phase(t, a, "ready")
-	phase(t, b, "ready")
+	phase(t, a, "playing")
+	phase(t, b, "playing")
 	send(t, a, command{Type: "leave", MatchID: ea.Match.ID})
 	phase(t, a, "entrance")
 	phase(t, b, "entrance")

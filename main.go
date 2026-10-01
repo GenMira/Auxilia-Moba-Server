@@ -22,8 +22,11 @@ type selection struct {
 	Spells    []string `json:"spells"`
 }
 type command struct {
-	Type    string `json:"type"`
-	MatchID string `json:"matchId"`
+	Target   string `json:"target"`
+	Position *point `json:"position"`
+	Sequence uint64 `json:"sequence"`
+	Type     string `json:"type"`
+	MatchID  string `json:"matchId"`
 	selection
 }
 type player struct {
@@ -33,6 +36,7 @@ type player struct {
 	selection
 }
 type match struct {
+	Game     *game     `json:"-"`
 	ID       string    `json:"id"`
 	Phase    string    `json:"phase"`
 	Players  [2]player `json:"players"`
@@ -173,6 +177,9 @@ func (l *lobby) state(s *session, notice string) {
 	for c := range s.connections {
 		l.emit(c, map[string]any{"type": "state", "selfId": s.id, "phase": phase, "selection": s.choice, "match": m, "notice": notice})
 	}
+	if m != nil && m.Phase == "playing" {
+		l.snapshot(s, m)
+	}
 }
 func (l *lobby) presence() {
 	n := l.active()
@@ -212,6 +219,8 @@ func (l *lobby) handle(c *client, cmd command, now time.Time) {
 	s.seen = now
 	fail := func(message string) { l.emit(c, map[string]string{"type": "error", "message": message}) }
 	switch cmd.Type {
+	case "move", "stop", "recall", "attack":
+		l.gameInput(c, cmd)
 	case "queue":
 		if s.queued || s.matchID != "" {
 			l.state(s, "")
@@ -259,7 +268,17 @@ func (l *lobby) handle(c *client, cmd command, now time.Time) {
 			return
 		}
 		if cmd.Type == "leave" {
-			l.finish(m, "プレイヤーが退出したため、マッチを終了しました。")
+			if m.Phase == "playing" {
+				winner := "相手"
+				for _, p := range m.Players {
+					if p.ID != s.id {
+						winner = p.Name
+					}
+				}
+				l.finish(m, winner+"の勝利（相手が退出）")
+			} else {
+				l.finish(m, "プレイヤーが退出したため、マッチを終了しました。")
+			}
 			return
 		}
 		if m.Phase != "loading" {
@@ -288,6 +307,48 @@ func (l *lobby) tick(now time.Time) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	for _, m := range l.matches {
+		if m.Phase == "playing" {
+			g := m.Game
+			ended := false
+			both := g.Actors[0].Disconnected && g.Actors[1].Disconnected
+			if both {
+				if now.Sub(g.Actors[0].disconnectedAt) >= 30*time.Second && now.Sub(g.Actors[1].disconnectedAt) >= 30*time.Second {
+					l.finish(m, "双方の切断から30秒経過したため、無効試合となりました。")
+					ended = true
+				}
+			} else {
+				for _, a := range g.Actors {
+					if a.Disconnected && now.Sub(a.disconnectedAt) >= 30*time.Second {
+						winner := "相手"
+						for _, other := range g.Actors {
+							if other.ID != a.ID {
+								winner = other.Name
+							}
+						}
+						l.finish(m, winner+"の勝利（相手が30秒間切断）")
+						ended = true
+						break
+					}
+				}
+			}
+			if ended {
+				continue
+			}
+			steps := 0
+			for now.Sub(g.lastStep) >= 50*time.Millisecond && steps < 10 {
+				g.advance()
+				g.lastStep = g.lastStep.Add(50 * time.Millisecond)
+				steps++
+			}
+			if steps > 0 && g.Step%2 == 0 {
+				for _, s := range l.sessions {
+					if s.matchID == m.ID {
+						l.snapshot(s, m)
+					}
+				}
+			}
+			continue
+		}
 		if now.UnixMilli() < m.Deadline {
 			continue
 		}
@@ -295,11 +356,10 @@ func (l *lobby) tick(now time.Time) {
 		case "loading":
 			l.finish(m, "準備が30秒以内に完了しなかったため、マッチを無効にしました。")
 		case "countdown":
-			m.Phase = "ready"
-			m.Deadline = now.Add(5 * time.Minute).UnixMilli()
+			m.Phase = "playing"
+			m.Game = newGame(m, now)
+			m.Deadline = 0
 			l.matchState(m)
-		case "ready":
-			l.finish(m, "対戦準備画面の保持時間が終了しました。")
 		}
 	}
 	for token, s := range l.sessions {
@@ -325,6 +385,13 @@ func (l *lobby) serveWS(w http.ResponseWriter, r *http.Request) {
 	}
 	c := &client{conn: conn, send: make(chan []byte, 64), session: s}
 	s.connections[c] = true
+	if m := l.matches[s.matchID]; m != nil && m.Game != nil {
+		for _, a := range m.Game.Actors {
+			if a.ID == s.id {
+				a.Disconnected = false
+			}
+		}
+	}
 	s.seen = time.Now()
 	l.state(s, "")
 	l.presence()
@@ -339,7 +406,17 @@ func (l *lobby) serveWS(w http.ResponseWriter, r *http.Request) {
 		if len(s.connections) == 0 {
 			l.removeQueue(s)
 			if m := l.matches[s.matchID]; m != nil {
-				l.finish(m, "相手との接続が切れたため、マッチを無効にしました。")
+				if m.Phase == "playing" {
+					for _, a := range m.Game.Actors {
+						if a.ID == s.id {
+							a.Disconnected = true
+							a.disconnectedAt = time.Now()
+							a.stop()
+						}
+					}
+				} else {
+					l.finish(m, "相手との接続が切れたため、マッチを無効にしました。")
+				}
 			}
 		}
 		l.presence()
@@ -392,7 +469,7 @@ func (l *lobby) serveWS(w http.ResponseWriter, r *http.Request) {
 func main() {
 	l := newLobby()
 	go func() {
-		ticker := time.NewTicker(100 * time.Millisecond)
+		ticker := time.NewTicker(50 * time.Millisecond)
 		defer ticker.Stop()
 		for now := range ticker.C {
 			l.tick(now)
