@@ -1,18 +1,32 @@
 package main
 
-import "math"
+import (
+	"math"
+	"sort"
+)
 
 type projectile struct {
-	ID        int    `json:"id"`
-	Owner     string `json:"owner"`
-	Target    string `json:"target"`
-	Position  point  `json:"position"`
+	Kind      string  `json:"kind"`
+	Direction point   `json:"direction"`
+	Remaining float64 `json:"remaining"`
+	Width     float64 `json:"width"`
+	ID        int     `json:"id"`
+	Owner     string  `json:"owner"`
+	Target    string  `json:"target"`
+	Position  point   `json:"position"`
 	damage    float64
 	spawnStep int64
 }
 type hit struct {
-	owner, target *avatar
-	damage        float64
+	owner, target      *avatar
+	damage             float64
+	source             string
+	trueDamage         bool
+	outgoingBonus      float64
+	at                 float64
+	id                 uint64
+	slow, slowDuration float64
+	effectID           string
 }
 
 func (g *game) actor(id string) *avatar {
@@ -32,9 +46,10 @@ func (a *avatar) stop() {
 }
 func (g *game) combat() {
 	seconds := float64(g.Step) * .05
-	hits := []hit{}
+	hits := g.resolveSkills()
+	hits = append(hits, g.statusTicks()...)
 	for _, a := range g.Actors {
-		if a.HP <= 0 {
+		if a.HP <= 0 || a.Cast != nil || a.hasStatus("stun", seconds) {
 			continue
 		}
 		target := g.actor(a.attackTarget)
@@ -53,7 +68,7 @@ func (g *game) combat() {
 						g.projectileID++
 						g.Projectiles = append(g.Projectiles, projectile{ID: g.projectileID, Owner: a.ID, Target: target.ID, Position: a.Position, damage: a.attackDamage, spawnStep: g.Step})
 					} else {
-						hits = append(hits, hit{a, target, a.attackDamage})
+						hits = append(hits, g.newHit(a, target, a.attackDamage, "attack", seconds))
 					}
 				}
 			}
@@ -87,6 +102,36 @@ func (g *game) combat() {
 			alive = append(alive, p)
 			continue
 		}
+		if p.Kind == "skill" {
+			travel := math.Min(1600*.05, p.Remaining)
+			obstacle := obstacleDistance(p.Position, p.Direction, math.Inf(1), p.Width/2)
+			contact := math.Inf(1)
+			var victim *avatar
+			owner := g.actor(p.Owner)
+			for _, a := range g.Actors {
+				if a.HP <= 0 || owner == nil || a.Team == owner.Team {
+					continue
+				}
+				d := rayCircle(p.Position, p.Direction, a.Position, p.Width/2+arena.Radius)
+				if d < contact || (d == contact && victim != nil && a.ID < victim.ID) {
+					contact = d
+					victim = a
+				}
+			}
+			if victim != nil && contact <= travel && contact < obstacle {
+				hits = append(hits, g.newHit(owner, victim, p.damage, "skill", seconds-.05+contact/1600))
+				continue
+			}
+			if obstacle <= travel {
+				continue
+			}
+			p.Position = point{p.Position.S + p.Direction.S*travel, p.Position.T + p.Direction.T*travel}
+			p.Remaining -= travel
+			if p.Remaining > 1e-8 {
+				alive = append(alive, p)
+			}
+			continue
+		}
 		target := g.actor(p.Target)
 		owner := g.actor(p.Owner)
 		if target == nil || target.HP <= 0 {
@@ -110,20 +155,35 @@ func (g *game) combat() {
 		}
 		p.Position = next
 		if d <= travel {
-			hits = append(hits, hit{owner, target, p.damage})
+			hits = append(hits, g.newHit(owner, target, p.damage, "attack", seconds-.05+d/1800))
 		} else {
 			alive = append(alive, p)
 		}
 	}
 	g.Projectiles = alive
+	sort.SliceStable(hits, func(i, j int) bool {
+		a, b := hits[i], hits[j]
+		if math.Abs(a.at-b.at) > 1e-8 {
+			return a.at < b.at
+		}
+		aid, bid := "", ""
+		if a.owner != nil {
+			aid = a.owner.ID
+		}
+		if b.owner != nil {
+			bid = b.owner.ID
+		}
+		if aid != bid {
+			return aid < bid
+		}
+		return a.id < b.id
+	})
 	killers := map[string]*avatar{}
 	for _, h := range hits {
 		if h.target.HP <= 0 {
 			continue
 		}
-		h.target.HP -= h.damage
-		h.target.RecallUntil = 0
-		h.target.HitAt = seconds
+		g.applyDamage(h)
 		if h.target.HP <= 0 {
 			killers[h.target.ID] = h.owner
 		}
@@ -135,6 +195,8 @@ func (g *game) combat() {
 			a.Deaths++
 			a.RespawnAt = seconds + math.Max(5, float64(a.Kills)*5)
 			a.stop()
+			a.Cast = nil
+			a.Statuses = []statusEffect{}
 		}
 	}
 	for _, a := range g.Actors {

@@ -6,6 +6,13 @@ import (
 )
 
 type avatar struct {
+	Skills         []skillView    `json:"skills,omitempty"`
+	Cast           *castState     `json:"cast"`
+	Statuses       []statusEffect `json:"statuses"`
+	MoveSpeed      float64        `json:"moveSpeed"`
+	SkillPower     float64        `json:"skillPower"`
+	ranks          [3]int
+	cooldowns      [3]float64
 	ID             string              `json:"id"`
 	Team           string              `json:"team"`
 	Character      string              `json:"character"`
@@ -39,6 +46,8 @@ type avatar struct {
 	revealedUntil  float64
 }
 type game struct {
+	Effects      []skillEffect
+	eventID      uint64
 	Actors       [2]*avatar
 	Step         int64
 	lastStep     time.Time
@@ -61,6 +70,8 @@ func newGame(m *match, now time.Time) *game {
 			facing.S = -1
 		}
 		g.Actors[i] = &avatar{ID: p.ID, Team: p.Team, Character: p.Character, Name: p.Name, Position: spawn(p.Team), Facing: facing, Stats: stats, HP: stats.HP, Mana: stats.Mana, Level: 1, Gold: 300}
+		g.Actors[i].ranks = [3]int{1, 1, 1}
+		g.Actors[i].Statuses = []statusEffect{}
 	}
 	return g
 }
@@ -95,6 +106,7 @@ func (g *game) visible(viewer, target *avatar) bool {
 func (g *game) advance() {
 	g.Step++
 	seconds := float64(g.Step) * .05
+	g.interruptCasts(seconds)
 	for _, a := range g.Actors {
 		if a.HP <= 0 {
 			if g.Step >= 200 && g.Step%20 == 0 {
@@ -114,7 +126,10 @@ func (g *game) advance() {
 		if g.Step >= 200 && g.Step%20 == 0 {
 			a.Gold += 2
 		}
-		remaining := a.Stats.Speed * .05
+		remaining := a.moveSpeed(seconds) * .05
+		if a.Cast != nil || a.hasStatus("stun", seconds) || a.hasStatus("root", seconds) {
+			remaining = 0
+		}
 		for len(a.path) > 0 && remaining > 0 {
 			target := a.path[0]
 			d := distance(a.Position, target)
@@ -161,6 +176,11 @@ func (l *lobby) snapshot(s *session, m *match) {
 	for _, a := range g.Actors {
 		if g.visible(self, a) {
 			copy := *a
+			copy.MoveSpeed = a.moveSpeed(float64(g.Step) * .05)
+			copy.Statuses = a.activeStatuses(float64(g.Step) * .05)
+			if a.ID == self.ID {
+				copy.Skills = g.skillViews(a)
+			}
 			copy.AttackUntil = a.windupUntil
 			if a.ID == self.ID {
 				copy.AttackTarget = a.attackTarget
@@ -175,7 +195,13 @@ func (l *lobby) snapshot(s *session, m *match) {
 			projectiles = append(projectiles, p)
 		}
 	}
-	message := map[string]any{"projectiles": projectiles, "type": "world", "matchId": m.ID, "time": float64(g.Step) * .05, "ack": self.sequence, "actors": actors, "map": arena}
+	effects := []skillEffect{}
+	for _, e := range g.Effects {
+		if e.Owner == self.ID || g.visible(self, &avatar{Position: e.Origin, HP: 1}) {
+			effects = append(effects, e)
+		}
+	}
+	message := map[string]any{"effects": effects, "projectiles": projectiles, "type": "world", "matchId": m.ID, "time": float64(g.Step) * .05, "ack": self.sequence, "actors": actors, "map": arena}
 	for c := range s.connections {
 		l.emit(c, message)
 	}

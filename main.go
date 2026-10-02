@@ -22,6 +22,7 @@ type selection struct {
 	Spells    []string `json:"spells"`
 }
 type command struct {
+	Slot     string `json:"slot"`
 	Target   string `json:"target"`
 	Position *point `json:"position"`
 	Sequence uint64 `json:"sequence"`
@@ -219,7 +220,7 @@ func (l *lobby) handle(c *client, cmd command, now time.Time) {
 	s.seen = now
 	fail := func(message string) { l.emit(c, map[string]string{"type": "error", "message": message}) }
 	switch cmd.Type {
-	case "move", "stop", "recall", "attack":
+	case "move", "stop", "recall", "attack", "cast":
 		l.gameInput(c, cmd)
 	case "queue":
 		if s.queued || s.matchID != "" {
