@@ -138,13 +138,17 @@ func (l *lobby) handler() http.Handler {
 			l.sessions[token] = s
 		}
 		s.seen = time.Now()
-		http.SetCookie(w, &http.Cookie{Name: "auxilia_moba_session", Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: r.TLS != nil, MaxAge: 86400})
+		http.SetCookie(w, &http.Cookie{Name: "auxilia_moba_session", Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: r.TLS != nil || os.Getenv("COOKIE_SECURE") == "true", MaxAge: 86400})
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
 		json.NewEncoder(w).Encode(map[string]string{"id": s.id})
 	})
 	mux.HandleFunc("/ws", l.serveWS)
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
 	return mux
 }
 
@@ -476,9 +480,9 @@ func main() {
 			l.tick(now)
 		}
 	}()
-	address := os.Getenv("ADDR")
-	if address == "" {
-		address = ":8080"
+	address, err := listenAddress()
+	if err != nil {
+		log.Fatal(err)
 	}
 	log.Printf("League of Auxilia lobby listening on %s", address)
 	server := &http.Server{Addr: address, Handler: l.handler(), ReadHeaderTimeout: 5 * time.Second}

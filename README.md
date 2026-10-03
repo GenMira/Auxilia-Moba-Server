@@ -1,5 +1,7 @@
 # League of Auxilia server
 
+NeoShowcase向けDockerfileと設定手順は [NEOSHOWCASE.md](NEOSHOWCASE.md) を参照してください。
+
 Go 1.24以上。外部DB不要のメモリー内ロビーと、サーバーが判定する1対1のゲーム処理です。
 
 ```sh
@@ -8,7 +10,7 @@ go test ./...
 go vet ./...
 ```
 
-`ADDR`（既定 `:8080`）で待受先を変更できます。UIの開発サーバーは既定の8080へプロキシします。
+`PORT`（既定 `8080`）で待受ポートを変更できます。`0.0.0.0`で待ち受け、`ADDR`を指定するとそちらを優先します。UIの開発サーバーは既定の8080へプロキシします。
 `ALLOWED_ORIGINS` は追加で許可するOriginのカンマ区切りリストです。既定では同一Originのみ受け入れます。
 
 ## プロトコル
