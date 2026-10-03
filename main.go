@@ -220,7 +220,7 @@ func (l *lobby) handle(c *client, cmd command, now time.Time) {
 	s.seen = now
 	fail := func(message string) { l.emit(c, map[string]string{"type": "error", "message": message}) }
 	switch cmd.Type {
-	case "move", "stop", "recall", "attack", "cast":
+	case "move", "stop", "recall", "attack", "cast", "spell", "upgrade":
 		l.gameInput(c, cmd)
 	case "queue":
 		if s.queued || s.matchID != "" {

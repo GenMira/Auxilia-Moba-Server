@@ -4,6 +4,10 @@ import "math"
 
 // Definitions are also sent to the owner: aiming and HUD use the server's values.
 type skillDefinition struct {
+	BlinkDistance                               float64 `json:"blinkDistance"`
+	HitRange                                    float64 `json:"hitRange"`
+	blinkDelay                                  float64
+	poison                                      bool
 	Slot                                        string  `json:"slot"`
 	Name                                        string  `json:"name"`
 	Aim                                         string  `json:"aim"`
@@ -21,6 +25,16 @@ type skillDefinition struct {
 }
 
 var skillDefinitions = map[string][3]skillDefinition{
+	"Nadia": {
+		{Slot: "q", Name: "対処番号05：対包囲戦術", Aim: "self", Shape: "circle", Radius: 220, Mana: 30, Cooldown: 5, Duration: .2, base: [3]float64{50, 75, 100}, attackRatio: .5, poison: true, Description: "自身の周囲にダメージと毒。毒は毎秒8、3秒間。"},
+		{Slot: "w", Name: "対処番号03：前方範囲殲滅", Aim: "direction", Shape: "cone", Range: 300, Angle: 100, Mana: 45, Cooldown: 8, Duration: .3, base: [3]float64{70, 100, 130}, attackRatio: .7, poison: true, Description: "前方100度の扇形にダメージと毒。"},
+		{Slot: "e", Name: "対処番号02：前方殲滅・改", Aim: "target", Shape: "target", Range: 480, HitRange: 180, BlinkDistance: 300, blinkDelay: .2, Mana: 60, Cooldown: 13, Duration: .5, base: [3]float64{100, 140, 180}, attackRatio: .9, poison: true, Description: "敵へ最大300Uブリンクし、到着後180U以内の指定対象にダメージと毒。"},
+	},
+	"Chiyo": {
+		{Slot: "q", Name: "一文字斬り", Aim: "direction", Shape: "cone", Range: 300, Angle: 180, Mana: 30, Cooldown: 6, Duration: .2, base: [3]float64{60, 90, 120}, attackRatio: .8, Description: "前方180度の扇形にダメージ。HP60%以上で開始すると威力+10%。"},
+		{Slot: "w", Name: "袈裟斬り", Aim: "direction", Shape: "cone", Range: 200, Angle: 90, BlinkDistance: 100, blinkDelay: .1, Mana: 45, Cooldown: 9, Duration: .4, base: [3]float64{80, 120, 160}, attackRatio: .8, Description: "100Uブリンク後、到着地点から90度の扇形攻撃。HP60%以上で開始すると威力+10%。"},
+		{Slot: "e", Name: "真向斬り", Aim: "target", Shape: "target", Range: 200, Mana: 60, Cooldown: 15, Duration: .3, base: [3]float64{100, 140, 180}, attackRatio: 1.1, Description: "可視の敵1体にダメージ。発動完了時も射程200U・視界が必要。"},
+	},
 	"Sophie": {
 		{Slot: "q", Name: "growth～成長～", Aim: "direction", Shape: "line", Range: 600, Width: 100, Mana: 40, Cooldown: 6, Duration: .2, base: [3]float64{60, 90, 120}, attackRatio: .6, Description: "直線上の敵すべてにダメージ。施設で遮られる。"},
 		{Slot: "w", Name: "bloom～開花～", Aim: "point", Shape: "circle", Range: 700, Radius: 180, Mana: 60, Cooldown: 10, Duration: .4, base: [3]float64{70, 100, 130}, powerRatio: .6, slow: .2, slowDuration: 2, Description: "指定円内にダメージと20%スロウ（2秒）。"},
@@ -34,6 +48,7 @@ var skillDefinitions = map[string][3]skillDefinition{
 }
 
 type skillView struct {
+	UpgradeReason string `json:"upgradeReason"`
 	skillDefinition
 	Rank    int     `json:"rank"`
 	Amount  float64 `json:"amount"`
@@ -41,15 +56,18 @@ type skillView struct {
 	Reason  string  `json:"reason"`
 }
 type castState struct {
-	Slot        string  `json:"slot"`
-	Shape       string  `json:"shape"`
-	Origin      point   `json:"origin"`
-	Direction   point   `json:"direction"`
-	Destination point   `json:"destination"`
-	EndsAt      float64 `json:"endsAt"`
-	definition  skillDefinition
-	amount      float64
-	target      string
+	blinkAt       float64
+	blinked       bool
+	outgoingBonus float64
+	Slot          string  `json:"slot"`
+	Shape         string  `json:"shape"`
+	Origin        point   `json:"origin"`
+	Direction     point   `json:"direction"`
+	Destination   point   `json:"destination"`
+	EndsAt        float64 `json:"endsAt"`
+	definition    skillDefinition
+	amount        float64
+	target        string
 }
 type skillEffect struct {
 	ID        uint64  `json:"id"`
@@ -95,6 +113,9 @@ func (g *game) skillReason(a *avatar, d skillDefinition, i int) string {
 	if a.hasStatus("silence", now) {
 		return "サイレンス中"
 	}
+	if d.BlinkDistance > 0 && a.hasStatus("root", now) {
+		return "ルート中"
+	}
 	if a.cooldowns[i] > now+1e-8 {
 		return "クールダウン中"
 	}
@@ -111,7 +132,8 @@ func (g *game) skillViews(a *avatar) []skillView {
 	views := []skillView{}
 	for i, d := range defs {
 		rank := max(1, min(3, a.ranks[i]))
-		views = append(views, skillView{d, rank, d.base[rank-1] + a.Stats.Attack*d.attackRatio + a.SkillPower*d.powerRatio, a.cooldowns[i], g.skillReason(a, d, i)})
+		amount := (d.base[rank-1] + a.Stats.Attack*d.attackRatio + a.SkillPower*d.powerRatio) * (1 + a.chiyoBonus(d.Slot))
+		views = append(views, skillView{skillDefinition: d, Rank: rank, Amount: amount, ReadyAt: a.cooldowns[i], Reason: g.skillReason(a, d, i), UpgradeReason: upgradeReason(a, i)})
 	}
 	return views
 }
@@ -155,6 +177,15 @@ func (g *game) startCast(a *avatar, cmd command) string {
 	a.Mana -= d.Mana
 	a.cooldowns[i] = now + d.Cooldown
 	a.Cast = &castState{Slot: cmd.Slot, Shape: d.Shape, Origin: a.Position, Direction: dir, Destination: dest, EndsAt: now + d.Duration, definition: d, amount: d.base[rank-1] + a.Stats.Attack*d.attackRatio + a.SkillPower*d.powerRatio, target: cmd.Target}
+	a.Cast.outgoingBonus = a.chiyoBonus(cmd.Slot)
+	if d.BlinkDistance > 0 {
+		travel := d.BlinkDistance
+		if d.Aim == "target" {
+			travel = math.Min(travel, math.Max(0, distanceTo-150))
+		}
+		a.Cast.Destination = blinkDestination(a.Position, point{a.Position.S + dir.S*travel, a.Position.T + dir.T*travel})
+		a.Cast.blinkAt = now + d.blinkDelay
+	}
 	if d.Shape != "heal" && bushAt(a.Position) >= 0 {
 		a.revealedUntil = now + 2
 	}
@@ -162,6 +193,9 @@ func (g *game) startCast(a *avatar, cmd command) string {
 }
 func (g *game) interruptCasts(now float64) {
 	for _, a := range g.Actors {
+		if a.Cast != nil && a.Cast.definition.BlinkDistance > 0 && !a.Cast.blinked && a.hasStatus("root", now) {
+			a.Cast = nil
+		}
 		if a.HP <= 0 || a.hasStatus("stun", now) || a.hasStatus("silence", now) {
 			a.Cast = nil
 		}
@@ -185,6 +219,15 @@ func (g *game) resolveSkills() []hit {
 		}
 	}
 	g.Effects = kept
+	// Resolve every blink before any same-tick area/target hit tests.
+	for _, a := range g.Actors {
+		c := a.Cast
+		if c != nil && c.definition.BlinkDistance > 0 && !c.blinked && c.blinkAt <= now+1e-8 {
+			a.Position = blinkDestination(a.Position, c.Destination)
+			c.Origin = a.Position
+			c.blinked = true
+		}
+	}
 	for _, a := range g.Actors {
 		c := a.Cast
 		if c == nil || c.EndsAt > now+1e-8 || a.HP <= 0 {
@@ -224,10 +267,16 @@ func (g *game) resolveSkills() []hit {
 			case "line":
 				hitTarget = segmentDistance(origin, point{origin.S + c.Direction.S*length, origin.T + c.Direction.T*length}, target.Position) <= d.Width/2+arena.Radius
 			case "target":
-				hitTarget = target.ID == c.target && g.visible(a, target) && distance(a.Position, target.Position) <= d.Range
+				r := d.Range
+				if d.HitRange > 0 {
+					r = d.HitRange
+				}
+				hitTarget = target.ID == c.target && g.visible(a, target) && distance(a.Position, target.Position) <= r
 			}
 			if hitTarget {
 				h := g.newHit(a, target, c.amount, "skill", c.EndsAt)
+				h.outgoingBonus = c.outgoingBonus
+				h.poison = d.poison
 				h.slow = d.slow
 				h.slowDuration = d.slowDuration
 				h.effectID = a.Character + "-" + d.Slot

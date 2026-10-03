@@ -24,12 +24,20 @@ func (l *lobby) gameInput(c *client, cmd command) {
 		result("死亡中")
 		return
 	}
+	if cmd.Type == "upgrade" {
+		result(m.Game.upgrade(a, cmd.Slot))
+		return
+	}
 	if a.Cast != nil {
 		result("発動中は操作できません")
 		return
 	}
 	if cmd.Type == "cast" {
 		result(m.Game.startCast(a, cmd))
+		return
+	}
+	if cmd.Type == "spell" {
+		result(m.Game.castSpell(a, cmd))
 		return
 	}
 	if a.hasStatus("stun", now) {

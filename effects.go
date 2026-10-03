@@ -106,6 +106,12 @@ type damageResult struct{ mitigated, absorbed, hpDamage float64 }
 func (g *game) applyDamage(h hit) damageResult {
 	now := float64(g.Step) * .05
 	amount := h.damage
+	if h.source == "attack" && h.owner != nil && h.owner.Character == "Nadia" {
+		h.owner.AttackCount = (h.owner.AttackCount + 1) % 3
+		if h.owner.AttackCount == 0 {
+			amount += h.damage * .5
+		}
+	}
 	if !h.trueDamage {
 		amount *= math.Max(0, 1+h.outgoingBonus)
 		incoming := 0.0
@@ -134,9 +140,19 @@ func (g *game) applyDamage(h hit) damageResult {
 			result.absorbed += used
 		}
 	}
+	kept := h.target.Statuses[:0]
+	for _, s := range h.target.Statuses {
+		if s.Kind != "shield" || s.Value > 0 {
+			kept = append(kept, s)
+		}
+	}
+	h.target.Statuses = kept
 	result.hpDamage = math.Min(math.Max(0, h.target.HP), amount)
 	h.target.HP -= amount
 	if h.source == "attack" || h.source == "skill" {
+		if h.poison && h.owner != nil {
+			h.target.addStatus(statusEffect{ID: "nadia-poison", Source: h.owner.ID, Kind: "poison", Until: now + 3, nextTick: now + 1, interval: 1, damage: 8})
+		}
 		if h.owner != nil && h.owner.Character == "Sophie" && h.owner.HP > 0 {
 			h.owner.addStatus(statusEffect{ID: "sowing", Source: h.owner.ID, Kind: "speed", Until: now + 2, Value: 30})
 		}

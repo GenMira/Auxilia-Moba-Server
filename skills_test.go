@@ -248,7 +248,9 @@ func TestSlowStackingZeroDamageProcAndShieldOrder(t *testing.T) {
 	near(t, result.absorbed, 50)
 	near(t, result.hpDamage, 0)
 	near(t, b.RecallUntil, 0)
-	near(t, b.Statuses[len(b.Statuses)-2].Value, 0)
+	if len(b.Statuses) != 3 {
+		t.Fatal("exhausted shield should be removed")
+	}
 	near(t, b.Statuses[len(b.Statuses)-1].Value, 70)
 }
 func TestCastInputOwnershipRejectionAndWirePrivacy(t *testing.T) {

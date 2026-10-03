@@ -18,6 +18,7 @@ type projectile struct {
 	spawnStep int64
 }
 type hit struct {
+	poison             bool
 	owner, target      *avatar
 	damage             float64
 	source             string
@@ -68,7 +69,9 @@ func (g *game) combat() {
 						g.projectileID++
 						g.Projectiles = append(g.Projectiles, projectile{ID: g.projectileID, Owner: a.ID, Target: target.ID, Position: a.Position, damage: a.attackDamage, spawnStep: g.Step})
 					} else {
-						hits = append(hits, g.newHit(a, target, a.attackDamage, "attack", seconds))
+						h := g.newHit(a, target, a.attackDamage, "attack", seconds)
+						h.outgoingBonus = a.attackBonus
+						hits = append(hits, h)
 					}
 				}
 			}
@@ -90,6 +93,7 @@ func (g *game) combat() {
 			a.nextAttack = seconds + interval
 			a.windupUntil = seconds + interval*.3
 			a.attackDamage = a.Stats.Attack
+			a.attackBonus = a.chiyoBonus("attack")
 			d := distance(a.Position, target.Position)
 			if d > 0 {
 				a.Facing = point{(target.Position.S - a.Position.S) / d, (target.Position.T - a.Position.T) / d}
@@ -197,6 +201,7 @@ func (g *game) combat() {
 			a.stop()
 			a.Cast = nil
 			a.Statuses = []statusEffect{}
+			a.AttackCount = 0
 		}
 	}
 	for _, a := range g.Actors {

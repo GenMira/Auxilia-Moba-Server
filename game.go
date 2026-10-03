@@ -6,6 +6,11 @@ import (
 )
 
 type avatar struct {
+	Spells         []skillView `json:"spells,omitempty"`
+	AttackCount    int         `json:"attackCount"`
+	spellIDs       [2]string
+	spellCD        [2]float64
+	attackBonus    float64
 	Skills         []skillView    `json:"skills,omitempty"`
 	Cast           *castState     `json:"cast"`
 	Statuses       []statusEffect `json:"statuses"`
@@ -71,6 +76,7 @@ func newGame(m *match, now time.Time) *game {
 		}
 		g.Actors[i] = &avatar{ID: p.ID, Team: p.Team, Character: p.Character, Name: p.Name, Position: spawn(p.Team), Facing: facing, Stats: stats, HP: stats.HP, Mana: stats.Mana, Level: 1, Gold: 300}
 		g.Actors[i].ranks = [3]int{1, 1, 1}
+		copy(g.Actors[i].spellIDs[:], p.Spells)
 		g.Actors[i].Statuses = []statusEffect{}
 	}
 	return g
@@ -180,6 +186,7 @@ func (l *lobby) snapshot(s *session, m *match) {
 			copy.Statuses = a.activeStatuses(float64(g.Step) * .05)
 			if a.ID == self.ID {
 				copy.Skills = g.skillViews(a)
+				copy.Spells = g.spellViews(a)
 			}
 			copy.AttackUntil = a.windupUntil
 			if a.ID == self.ID {
