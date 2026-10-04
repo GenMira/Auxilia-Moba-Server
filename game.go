@@ -6,6 +6,17 @@ import (
 )
 
 type avatar struct {
+	Kind         string `json:"kind"`
+	LastHits     int    `json:"lastHits"`
+	lane         float64
+	anchor       point
+	guardUntil   float64
+	shots        int
+	unlocked     bool
+	lastDamager  string
+	lastDamageAt float64
+	spawnStep    int64
+
 	Spells         []skillView `json:"spells,omitempty"`
 	AttackCount    int         `json:"attackCount"`
 	spellIDs       [2]string
@@ -51,6 +62,12 @@ type avatar struct {
 	revealedUntil  float64
 }
 type game struct {
+	Minions    []*avatar
+	Structures []*avatar
+	Winner     string
+	lastSeen   map[string]map[string]float64
+	disableNPC bool // Unit-test fixture isolation; never set by network input.
+
 	Effects      []skillEffect
 	eventID      uint64
 	Actors       [2]*avatar
@@ -67,7 +84,10 @@ func spawn(team string) point {
 	return point{5800, 0}
 }
 func newGame(m *match, now time.Time) *game {
-	g := &game{lastStep: now}
+	g := &game{lastStep: now, lastSeen: map[string]map[string]float64{}}
+	for _, o := range arena.Structures {
+		g.Structures = append(g.Structures, &avatar{ID: o.ID, Team: o.Team, Kind: o.Kind, Name: o.ID, Position: o.Position, HP: o.HP, Stats: characterDefinition{HP: o.HP, Range: 750, AttackSpeed: 1, Attack: 100}})
+	}
 	for i, p := range m.Players {
 		stats := characterDefinitions[p.Character]
 		facing := point{1, 0}
@@ -79,10 +99,11 @@ func newGame(m *match, now time.Time) *game {
 		copy(g.Actors[i].spellIDs[:], p.Spells)
 		g.Actors[i].Statuses = []statusEffect{}
 	}
+	g.unlockStructures()
 	return g
 }
 func (g *game) visible(viewer, target *avatar) bool {
-	if viewer.ID == target.ID {
+	if viewer.ID == target.ID || (viewer.Team != "" && viewer.Team == target.Team) {
 		return true
 	}
 	if target.HP <= 0 {
@@ -92,25 +113,29 @@ func (g *game) visible(viewer, target *avatar) bool {
 		return true
 	}
 	targetBush := bushAt(target.Position)
-	if viewer.HP > 0 && distance(viewer.Position, target.Position) <= 1200 && (targetBush < 0 || bushAt(viewer.Position) == targetBush) {
-		return true
-	}
-	for _, o := range arena.Structures {
-		if o.Team != viewer.Team {
+	for _, source := range g.entities() {
+		if source.Team != viewer.Team || source.HP <= 0 {
 			continue
 		}
-		radius := 1000.0
-		if o.Kind == "base" {
+		radius := 1200.0
+		switch source.Kind {
+		case "minion", "base":
 			radius = 800
+		case "tower":
+			radius = 1000
 		}
-		if distance(o.Position, target.Position) <= radius && (targetBush < 0 || bushAt(o.Position) == targetBush) {
+		if distance(source.Position, target.Position) <= radius && (targetBush < 0 || bushAt(source.Position) == targetBush) {
 			return true
 		}
 	}
 	return false
 }
 func (g *game) advance() {
+	if g.Winner != "" {
+		return
+	}
 	g.Step++
+	g.unlockStructures()
 	seconds := float64(g.Step) * .05
 	g.interruptCasts(seconds)
 	for _, a := range g.Actors {
@@ -132,30 +157,13 @@ func (g *game) advance() {
 		if g.Step >= 200 && g.Step%20 == 0 {
 			a.Gold += 2
 		}
-		remaining := a.moveSpeed(seconds) * .05
-		if a.Cast != nil || a.hasStatus("stun", seconds) || a.hasStatus("root", seconds) {
-			remaining = 0
-		}
-		for len(a.path) > 0 && remaining > 0 {
-			target := a.path[0]
-			d := distance(a.Position, target)
-			if d < .001 {
-				a.path = a.path[1:]
-				continue
-			}
-			travel := math.Min(remaining, d)
-			a.Facing = point{(target.S - a.Position.S) / d, (target.T - a.Position.T) / d}
-			a.Position.S += a.Facing.S * travel
-			a.Position.T += a.Facing.T * travel
-			remaining -= travel
-			if travel >= d {
-				a.Position = target
-				a.path = a.path[1:]
-			}
-		}
-		a.Moving = len(a.path) > 0
+		g.moveActor(a, seconds)
 	}
+	g.advanceNPC()
 	g.combat()
+	if g.Winner != "" {
+		return
+	}
 	// Damage on the completion tick still interrupts recall.
 	for _, a := range g.Actors {
 		if a.HP > 0 && a.RecallUntil > 0 && seconds+1e-8 >= a.RecallUntil {
@@ -163,6 +171,33 @@ func (g *game) advance() {
 			a.stop()
 		}
 	}
+}
+func (g *game) moveActor(a *avatar, seconds float64) {
+	remaining := a.moveSpeed(seconds) * .05
+	if a.Kind == "minion" && a.attackTarget != "" {
+		remaining = math.Min(remaining, math.Max(0, 600-distance(a.Position, a.anchor)))
+	}
+	if a.Cast != nil || a.hasStatus("stun", seconds) || a.hasStatus("root", seconds) {
+		remaining = 0
+	}
+	for len(a.path) > 0 && remaining > 0 {
+		target := a.path[0]
+		d := distance(a.Position, target)
+		if d < .001 {
+			a.path = a.path[1:]
+			continue
+		}
+		travel := math.Min(remaining, d)
+		a.Facing = point{(target.S - a.Position.S) / d, (target.T - a.Position.T) / d}
+		a.Position.S += a.Facing.S * travel
+		a.Position.T += a.Facing.T * travel
+		remaining -= travel
+		if travel >= d {
+			a.Position = target
+			a.path = a.path[1:]
+		}
+	}
+	a.Moving = len(a.path) > 0
 }
 func (l *lobby) snapshot(s *session, m *match) {
 	if m.Game == nil {
@@ -208,7 +243,7 @@ func (l *lobby) snapshot(s *session, m *match) {
 			effects = append(effects, e)
 		}
 	}
-	message := map[string]any{"effects": effects, "projectiles": projectiles, "type": "world", "matchId": m.ID, "time": float64(g.Step) * .05, "ack": self.sequence, "actors": actors, "map": arena}
+	message := map[string]any{"effects": effects, "projectiles": projectiles, "type": "world", "matchId": m.ID, "time": float64(g.Step) * .05, "ack": self.sequence, "actors": actors, "map": g.mapView(self), "minions": g.minionViews(self), "winner": g.Winner}
 	for c := range s.connections {
 		l.emit(c, message)
 	}

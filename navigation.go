@@ -6,41 +6,53 @@ import (
 )
 
 func distance(a, b point) float64 { return math.Hypot(a.S-b.S, a.T-b.T) }
-func legal(p point) bool {
-	if p.S < arena.Radius || p.S > arena.Length-arena.Radius || p.T < -arena.Width/2+arena.Radius || p.T > arena.Width/2-arena.Radius {
+
+type navigation struct {
+	structures []structure
+	radius     float64
+}
+
+func (g *game) navigation(a *avatar) navigation { return navigation{g.liveStructures(), a.radius()} }
+func legal(p point) bool                        { return navigation{arena.Structures, arena.Radius}.legal(p) }
+func clearSegment(a, b point) bool {
+	return navigation{arena.Structures, arena.Radius}.clearSegment(a, b)
+}
+func findPath(a, b point) []point { return navigation{arena.Structures, arena.Radius}.findPath(a, b) }
+func (geo navigation) legal(p point) bool {
+	if p.S < geo.radius || p.S > arena.Length-geo.radius || p.T < -arena.Width/2+geo.radius || p.T > arena.Width/2-geo.radius {
 		return false
 	}
-	for _, o := range arena.Structures {
-		if distance(p, o.Position) < o.Radius+arena.Radius+0.01 {
+	for _, o := range geo.structures {
+		if distance(p, o.Position) < o.Radius+geo.radius+0.01 {
 			return false
 		}
 	}
 	return true
 }
-func clearSegment(a, b point) bool {
-	if !legal(a) || !legal(b) {
+func (geo navigation) clearSegment(a, b point) bool {
+	if !geo.legal(a) || !geo.legal(b) {
 		return false
 	}
 	dx, dy := b.S-a.S, b.T-a.T
 	square := dx*dx + dy*dy
-	for _, o := range arena.Structures {
+	for _, o := range geo.structures {
 		t := 0.0
 		if square > 0 {
 			t = math.Max(0, math.Min(1, ((o.Position.S-a.S)*dx+(o.Position.T-a.T)*dy)/square))
 		}
-		if distance(point{a.S + t*dx, a.T + t*dy}, o.Position) < o.Radius+arena.Radius+0.01 {
+		if distance(point{a.S + t*dx, a.T + t*dy}, o.Position) < o.Radius+geo.radius+0.01 {
 			return false
 		}
 	}
 	return true
 }
 func nodePoint(id int) point { return point{float64(id/29) * 50, float64(id%29)*50 - 700} }
-func nearestNode(p point, connect bool) int {
+func (geo navigation) nearestNode(p point, connect bool) int {
 	best := -1
 	length := math.Inf(1)
 	for id := 0; id < 121*29; id++ {
 		q := nodePoint(id)
-		if !legal(q) || (connect && !clearSegment(p, q)) {
+		if !geo.legal(q) || (connect && !geo.clearSegment(p, q)) {
 			continue
 		}
 		d := distance(p, q)
@@ -68,18 +80,18 @@ func (h nodeHeap) Less(i, j int) bool {
 func (h nodeHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
 func (h *nodeHeap) Push(v any)   { *h = append(*h, v.(searchNode)) }
 func (h *nodeHeap) Pop() any     { a := *h; v := a[len(a)-1]; *h = a[:len(a)-1]; return v }
-func findPath(start, target point) []point {
-	if !legal(target) {
-		n := nearestNode(target, false)
+func (geo navigation) findPath(start, target point) []point {
+	if !geo.legal(target) {
+		n := geo.nearestNode(target, false)
 		if n < 0 {
 			return nil
 		}
 		target = nodePoint(n)
 	}
-	if clearSegment(start, target) {
+	if geo.clearSegment(start, target) {
 		return []point{target}
 	}
-	first, last := nearestNode(start, true), nearestNode(target, true)
+	first, last := geo.nearestNode(start, true), geo.nearestNode(target, true)
 	if first < 0 || last < 0 {
 		return nil
 	}
@@ -109,7 +121,7 @@ func findPath(start, target point) []point {
 			result := []point{}
 			for i := 0; i < len(route)-1; {
 				j := len(route) - 1
-				for j > i+1 && !clearSegment(route[i], route[j]) {
+				for j > i+1 && !geo.clearSegment(route[i], route[j]) {
 					j--
 				}
 				result = append(result, route[j])
@@ -128,7 +140,7 @@ func findPath(start, target point) []point {
 					continue
 				}
 				next := nx*29 + ny
-				if closed[next] || !clearSegment(nodePoint(current), nodePoint(next)) {
+				if closed[next] || !geo.clearSegment(nodePoint(current), nodePoint(next)) {
 					continue
 				}
 				cost := costs[current] + distance(nodePoint(current), nodePoint(next))

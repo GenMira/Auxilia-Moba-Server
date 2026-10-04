@@ -150,7 +150,7 @@ func (g *game) startCast(a *avatar, cmd command) string {
 	dest, dir := a.Position, a.Facing
 	if d.Aim == "target" {
 		target := g.actor(cmd.Target)
-		if target == nil || target.Team == a.Team || target.HP <= 0 || !g.visible(a, target) {
+		if target == nil || target.isStructure() || (a.Character == "Chiyo" && !target.isChampion()) || target.Team == a.Team || target.HP <= 0 || !g.visible(a, target) {
 			return "対象を指定できません"
 		}
 		if distance(a.Position, target.Position) > d.Range {
@@ -183,7 +183,7 @@ func (g *game) startCast(a *avatar, cmd command) string {
 		if d.Aim == "target" {
 			travel = math.Min(travel, math.Max(0, distanceTo-150))
 		}
-		a.Cast.Destination = blinkDestination(a.Position, point{a.Position.S + dir.S*travel, a.Position.T + dir.T*travel})
+		a.Cast.Destination = g.navigation(a).blinkDestination(a.Position, point{a.Position.S + dir.S*travel, a.Position.T + dir.T*travel})
 		a.Cast.blinkAt = now + d.blinkDelay
 	}
 	if d.Shape != "heal" && bushAt(a.Position) >= 0 {
@@ -223,7 +223,7 @@ func (g *game) resolveSkills() []hit {
 	for _, a := range g.Actors {
 		c := a.Cast
 		if c != nil && c.definition.BlinkDistance > 0 && !c.blinked && c.blinkAt <= now+1e-8 {
-			a.Position = blinkDestination(a.Position, c.Destination)
+			a.Position = g.navigation(a).blinkDestination(a.Position, c.Destination)
 			c.Origin = a.Position
 			c.blinked = true
 		}
@@ -250,22 +250,22 @@ func (g *game) resolveSkills() []hit {
 		}
 		length := d.Range
 		if d.Shape == "line" {
-			length = obstacleDistance(origin, c.Direction, length, d.Width/2)
+			length = g.navigation(a).obstacleDistance(origin, c.Direction, length, d.Width/2)
 		}
 		g.eventID++
 		g.Effects = append(g.Effects, skillEffect{g.eventID, a.ID, d.Shape, origin, c.Direction, length, d.Radius, d.Width, d.Angle, now + .35})
-		for _, target := range g.Actors {
+		for _, target := range g.units() {
 			if target.Team == a.Team || target.HP <= 0 || d.Shape == "heal" {
 				continue
 			}
 			hitTarget := false
 			switch d.Shape {
 			case "circle":
-				hitTarget = distance(origin, target.Position) <= d.Radius+arena.Radius
+				hitTarget = distance(origin, target.Position) <= d.Radius+target.radius()
 			case "cone":
-				hitTarget = coneIntersects(origin, c.Direction, d.Range, d.Angle, target.Position, arena.Radius)
+				hitTarget = coneIntersects(origin, c.Direction, d.Range, d.Angle, target.Position, target.radius())
 			case "line":
-				hitTarget = segmentDistance(origin, point{origin.S + c.Direction.S*length, origin.T + c.Direction.T*length}, target.Position) <= d.Width/2+arena.Radius
+				hitTarget = segmentDistance(origin, point{origin.S + c.Direction.S*length, origin.T + c.Direction.T*length}, target.Position) <= d.Width/2+target.radius()
 			case "target":
 				r := d.Range
 				if d.HitRange > 0 {
@@ -328,7 +328,10 @@ func rayCircle(origin, dir, center point, radius float64) float64 {
 	return t
 }
 func obstacleDistance(origin, dir point, limit, width float64) float64 {
-	for _, o := range arena.Structures {
+	return navigation{arena.Structures, arena.Radius}.obstacleDistance(origin, dir, limit, width)
+}
+func (geo navigation) obstacleDistance(origin, dir point, limit, width float64) float64 {
+	for _, o := range geo.structures {
 		limit = math.Min(limit, rayCircle(origin, dir, o.Position, o.Radius+width))
 	}
 	// Border crossing is based on the projectile center, matching the map rule.

@@ -182,7 +182,7 @@ func (l *lobby) state(s *session, notice string) {
 	for c := range s.connections {
 		l.emit(c, map[string]any{"type": "state", "selfId": s.id, "phase": phase, "selection": s.choice, "match": m, "notice": notice})
 	}
-	if m != nil && m.Phase == "playing" {
+	if m != nil && (m.Phase == "playing" || m.Phase == "finished") {
 		l.snapshot(s, m)
 	}
 }
@@ -273,6 +273,11 @@ func (l *lobby) handle(c *client, cmd command, now time.Time) {
 			return
 		}
 		if cmd.Type == "leave" {
+			if m.Phase == "finished" {
+				s.matchID = ""
+				l.state(s, "")
+				return
+			}
 			if m.Phase == "playing" {
 				winner := "相手"
 				for _, p := range m.Players {
@@ -314,6 +319,18 @@ func (l *lobby) tick(now time.Time) {
 	for _, m := range l.matches {
 		if m.Phase == "playing" {
 			g := m.Game
+			steps := 0
+			for now.Sub(g.lastStep) >= 50*time.Millisecond && steps < 10 && g.Winner == "" {
+				g.advance()
+				g.lastStep = g.lastStep.Add(50 * time.Millisecond)
+				steps++
+			}
+			if g.Winner != "" {
+				m.Phase = "finished"
+				m.Deadline = now.Add(5 * time.Minute).UnixMilli()
+				l.matchState(m)
+				continue
+			}
 			ended := false
 			both := g.Actors[0].Disconnected && g.Actors[1].Disconnected
 			if both {
@@ -339,12 +356,7 @@ func (l *lobby) tick(now time.Time) {
 			if ended {
 				continue
 			}
-			steps := 0
-			for now.Sub(g.lastStep) >= 50*time.Millisecond && steps < 10 {
-				g.advance()
-				g.lastStep = g.lastStep.Add(50 * time.Millisecond)
-				steps++
-			}
+
 			if steps > 0 && g.Step%2 == 0 {
 				for _, s := range l.sessions {
 					if s.matchID == m.ID {
@@ -358,6 +370,8 @@ func (l *lobby) tick(now time.Time) {
 			continue
 		}
 		switch m.Phase {
+		case "finished":
+			l.finish(m, "試合結果の保存期間が終了しました。")
 		case "loading":
 			l.finish(m, "準備が30秒以内に完了しなかったため、マッチを無効にしました。")
 		case "countdown":
@@ -419,7 +433,7 @@ func (l *lobby) serveWS(w http.ResponseWriter, r *http.Request) {
 							a.stop()
 						}
 					}
-				} else {
+				} else if m.Phase != "finished" {
 					l.finish(m, "相手との接続が切れたため、マッチを無効にしました。")
 				}
 			}

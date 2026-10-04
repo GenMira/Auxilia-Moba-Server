@@ -11,6 +11,7 @@ func testGame() (*lobby, *match, *client) {
 	l := newLobby()
 	m := &match{ID: "test", Phase: "playing", Players: [2]player{{ID: "a", Team: "blue", selection: selection{Name: "A", Character: "Sophie"}}, {ID: "b", Team: "red", selection: selection{Name: "B", Character: "Nadia"}}}}
 	m.Game = newGame(m, time.Unix(0, 0))
+	m.Game.disableNPC = true
 	l.matches[m.ID] = m
 	s := &session{id: "a", matchID: m.ID, connections: map[*client]bool{}}
 	c := &client{session: s, send: make(chan []byte, 64)}

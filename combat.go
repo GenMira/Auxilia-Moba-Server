@@ -32,6 +32,16 @@ type hit struct {
 
 func (g *game) actor(id string) *avatar {
 	for _, a := range g.Actors {
+		if a != nil && a.ID == id {
+			return a
+		}
+	}
+	for _, a := range g.Minions {
+		if a.ID == id {
+			return a
+		}
+	}
+	for _, a := range g.Structures {
 		if a.ID == id {
 			return a
 		}
@@ -44,32 +54,47 @@ func (a *avatar) stop() {
 	a.attackTarget = ""
 	a.windupUntil = 0
 	a.RecallUntil = 0
+	a.shots = 0
 }
 func (g *game) combat() {
 	seconds := float64(g.Step) * .05
 	hits := g.resolveSkills()
 	hits = append(hits, g.statusTicks()...)
-	for _, a := range g.Actors {
+	for _, a := range g.entities() {
+		if a.Kind == "base" || (g.disableNPC && !a.isChampion()) {
+			continue
+		}
 		if a.HP <= 0 || a.Cast != nil || a.hasStatus("stun", seconds) {
 			continue
 		}
 		target := g.actor(a.attackTarget)
 		if target == nil {
+			if a.attackTarget != "" {
+				a.stop()
+			}
 			continue
 		}
-		if target.HP <= 0 || !g.visible(a, target) {
+		if target.HP <= 0 || (target.isStructure() && !target.unlocked) || !g.visible(a, target) {
 			a.stop()
 			continue
 		}
 		if a.windupUntil > 0 {
 			if seconds+1e-8 >= a.windupUntil {
+				impactAt := a.windupUntil
 				a.windupUntil = 0
 				if distance(a.Position, target.Position) <= a.Stats.Range {
-					if a.Character == "Sophie" {
+					if a.Character == "Sophie" || a.Kind == "tower" {
+						kind := ""
+						damage := a.attackDamage
+						if a.Kind == "tower" {
+							kind = "tower"
+							a.shots++
+							damage = 100 * float64(a.shots)
+						}
 						g.projectileID++
-						g.Projectiles = append(g.Projectiles, projectile{ID: g.projectileID, Owner: a.ID, Target: target.ID, Position: a.Position, damage: a.attackDamage, spawnStep: g.Step})
+						g.Projectiles = append(g.Projectiles, projectile{Kind: kind, ID: g.projectileID, Owner: a.ID, Target: target.ID, Position: a.Position, damage: damage, spawnStep: g.Step})
 					} else {
-						h := g.newHit(a, target, a.attackDamage, "attack", seconds)
+						h := g.newHit(a, target, a.attackDamage, "attack", impactAt)
 						h.outgoingBonus = a.attackBonus
 						hits = append(hits, h)
 					}
@@ -79,7 +104,9 @@ func (g *game) combat() {
 		}
 		if distance(a.Position, target.Position) > a.Stats.Range {
 			if g.Step%5 == 0 || len(a.path) == 0 {
-				a.path = findPath(a.Position, target.Position)
+				if !a.isStructure() {
+					a.path = g.navigation(a).findPath(a.Position, target.Position)
+				}
 			}
 			continue
 		}
@@ -108,15 +135,15 @@ func (g *game) combat() {
 		}
 		if p.Kind == "skill" {
 			travel := math.Min(1600*.05, p.Remaining)
-			obstacle := obstacleDistance(p.Position, p.Direction, math.Inf(1), p.Width/2)
+			obstacle := g.navigation(g.Actors[0]).obstacleDistance(p.Position, p.Direction, math.Inf(1), p.Width/2)
 			contact := math.Inf(1)
 			var victim *avatar
 			owner := g.actor(p.Owner)
-			for _, a := range g.Actors {
+			for _, a := range g.units() {
 				if a.HP <= 0 || owner == nil || a.Team == owner.Team {
 					continue
 				}
-				d := rayCircle(p.Position, p.Direction, a.Position, p.Width/2+arena.Radius)
+				d := rayCircle(p.Position, p.Direction, a.Position, p.Width/2+a.radius())
 				if d < contact || (d == contact && victim != nil && a.ID < victim.ID) {
 					contact = d
 					victim = a
@@ -142,13 +169,20 @@ func (g *game) combat() {
 			continue
 		}
 		d := distance(p.Position, target.Position)
-		travel := math.Min(1800*.05, d)
+		speed := 1800.0
+		if p.Kind == "tower" {
+			speed = 2000
+		}
+		travel := math.Min(speed*.05, d)
 		next := target.Position
 		if d > travel {
 			next = point{p.Position.S + (target.Position.S-p.Position.S)*travel/d, p.Position.T + (target.Position.T-p.Position.T)*travel/d}
 		}
 		blocked := false
-		for _, o := range arena.Structures {
+		for _, o := range g.liveStructures() {
+			if p.Kind == "tower" || o.ID == p.Target || o.ID == p.Owner {
+				continue
+			}
 			if segmentDistance(p.Position, next, o.Position) < o.Radius {
 				blocked = true
 				break
@@ -159,7 +193,7 @@ func (g *game) combat() {
 		}
 		p.Position = next
 		if d <= travel {
-			hits = append(hits, g.newHit(owner, target, p.damage, "attack", seconds-.05+d/1800))
+			hits = append(hits, g.newHit(owner, target, p.damage, "attack", seconds-.05+d/speed))
 		} else {
 			alive = append(alive, p)
 		}
@@ -189,9 +223,17 @@ func (g *game) combat() {
 		}
 		g.applyDamage(h)
 		if h.target.HP <= 0 {
-			killers[h.target.ID] = h.owner
+			killer := h.owner
+			if h.target.isChampion() && (killer == nil || !killer.isChampion()) {
+				killer = nil
+				if seconds-h.target.lastDamageAt <= 10 && h.target.lastDamager != "" {
+					killer = g.actor(h.target.lastDamager)
+				}
+			}
+			killers[h.target.ID] = killer
 		}
 	}
+	g.rewardNPCDeaths(killers)
 	// Freeze death times before awarding same-tick kills, allowing mutual kills.
 	for _, a := range g.Actors {
 		if _, dead := killers[a.ID]; dead {
@@ -202,6 +244,8 @@ func (g *game) combat() {
 			a.Cast = nil
 			a.Statuses = []statusEffect{}
 			a.AttackCount = 0
+			a.lastDamager = ""
+			a.lastDamageAt = 0
 		}
 	}
 	for _, a := range g.Actors {
@@ -224,6 +268,7 @@ func (g *game) combat() {
 			a.streak = 0
 		}
 	}
+	g.checkVictory()
 }
 func segmentDistance(a, b, c point) float64 {
 	dx, dy := b.S-a.S, b.T-a.T

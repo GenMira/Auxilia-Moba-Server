@@ -6,7 +6,7 @@ func (l *lobby) gameInput(c *client, cmd command) {
 	}
 	s := c.session
 	m := l.matches[s.matchID]
-	if m == nil || m.ID != cmd.MatchID || m.Phase != "playing" || m.Game == nil {
+	if m == nil || m.ID != cmd.MatchID || m.Phase != "playing" || m.Game == nil || m.Game.Winner != "" {
 		result("試合が一致しません")
 		return
 	}
@@ -55,12 +55,12 @@ func (l *lobby) gameInput(c *client, cmd command) {
 			return
 		}
 		a.stop()
-		a.path = findPath(a.Position, *cmd.Position)
+		a.path = m.Game.navigation(a).findPath(a.Position, *cmd.Position)
 	case "stop":
 		a.stop()
 	case "attack":
 		target := m.Game.actor(cmd.Target)
-		if target == nil || target.Team == a.Team || target.HP <= 0 || !m.Game.visible(a, target) {
+		if target == nil || (target.isStructure() && !target.unlocked) || target.Team == a.Team || target.HP <= 0 || !m.Game.visible(a, target) {
 			result("対象を指定できません")
 			return
 		}

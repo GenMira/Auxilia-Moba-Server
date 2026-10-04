@@ -83,7 +83,7 @@ func (g *game) castSpell(a *avatar, cmd command) string {
 		}
 		ratio := math.Min(1, d.Range/dist)
 		end := point{a.Position.S + (cmd.Position.S-a.Position.S)*ratio, a.Position.T + (cmd.Position.T-a.Position.T)*ratio}
-		end = blinkDestination(a.Position, end)
+		end = g.navigation(a).blinkDestination(a.Position, end)
 		if distance(a.Position, end) < 1 {
 			return "移動距離不足"
 		}
@@ -91,7 +91,7 @@ func (g *game) castSpell(a *avatar, cmd command) string {
 		a.Position = end
 	case "ignite":
 		target := g.actor(cmd.Target)
-		if target == nil || target.Team == a.Team || target.HP <= 0 || !g.visible(a, target) {
+		if target == nil || !target.isChampion() || target.Team == a.Team || target.HP <= 0 || !g.visible(a, target) {
 			return "対象を指定できません"
 		}
 		if distance(a.Position, target.Position) > d.Range {
@@ -113,6 +113,9 @@ func (g *game) castSpell(a *avatar, cmd command) string {
 // Return the furthest legal point on the segment. Only landing occupancy matters:
 // a legal endpoint beyond a building is reachable without testing the path.
 func blinkDestination(start, end point) point {
+	return navigation{arena.Structures, arena.Radius}.blinkDestination(start, end)
+}
+func (geo navigation) blinkDestination(start, end point) point {
 	d := distance(start, end)
 	if d < 1e-8 {
 		return start
@@ -129,13 +132,13 @@ func blinkDestination(start, end point) point {
 	} else if dir.T < 0 {
 		limit = math.Min(limit, (-arena.Width/2+arena.Radius-start.T)/dir.T)
 	}
-	for tries := 0; tries <= len(arena.Structures); tries++ {
+	for tries := 0; tries <= len(geo.structures); tries++ {
 		p := point{start.S + dir.S*math.Max(0, limit), start.T + dir.T*math.Max(0, limit)}
-		if legal(p) {
+		if geo.legal(p) {
 			return p
 		}
 		changed := false
-		for _, o := range arena.Structures {
+		for _, o := range geo.structures {
 			if distance(p, o.Position) < o.Radius+arena.Radius+.01 {
 				entry := rayCircle(start, dir, o.Position, o.Radius+arena.Radius+.010001)
 				if entry <= limit {

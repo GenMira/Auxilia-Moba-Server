@@ -30,6 +30,9 @@ func (a *avatar) activeStatuses(now float64) []statusEffect {
 	return out
 }
 func (a *avatar) addStatus(effect statusEffect) {
+	if a.isStructure() {
+		return
+	}
 	for i, s := range a.Statuses {
 		if s.ID == effect.ID && s.Source == effect.Source {
 			if effect.Kind != "shield" {
@@ -74,7 +77,7 @@ func (a *avatar) moveSpeed(now float64) float64 {
 func (g *game) statusTicks() []hit {
 	now := float64(g.Step) * .05
 	hits := []hit{}
-	for _, a := range g.Actors {
+	for _, a := range g.units() {
 		if a.HP <= 0 {
 			continue
 		}
@@ -106,6 +109,19 @@ type damageResult struct{ mitigated, absorbed, hpDamage float64 }
 func (g *game) applyDamage(h hit) damageResult {
 	now := float64(g.Step) * .05
 	amount := h.damage
+	if h.target.isStructure() {
+		if h.source != "attack" || h.owner == nil || h.owner.isStructure() || !h.target.unlocked {
+			return damageResult{}
+		}
+		if h.owner.isChampion() && !g.hasMinionSupport(h.owner.Team, h.target.Position) {
+			amount *= .2
+		}
+		amount = math.Max(0, amount)
+		result := damageResult{mitigated: amount, hpDamage: math.Min(h.target.HP, amount)}
+		h.target.HP = math.Max(0, h.target.HP-amount)
+		h.target.HitAt = now
+		return result
+	}
 	if h.source == "attack" && h.owner != nil && h.owner.Character == "Nadia" {
 		h.owner.AttackCount = (h.owner.AttackCount + 1) % 3
 		if h.owner.AttackCount == 0 {
@@ -148,12 +164,17 @@ func (g *game) applyDamage(h hit) damageResult {
 	}
 	h.target.Statuses = kept
 	result.hpDamage = math.Min(math.Max(0, h.target.HP), amount)
-	h.target.HP -= amount
+	h.target.HP = math.Max(0, h.target.HP-amount)
+	if result.absorbed+result.hpDamage > 0 && h.owner != nil && h.owner.isChampion() && h.target.isChampion() {
+		h.target.lastDamager = h.owner.ID
+		h.target.lastDamageAt = now
+		g.protect(h.owner, h.target, now)
+	}
 	if h.source == "attack" || h.source == "skill" {
 		if h.poison && h.owner != nil {
 			h.target.addStatus(statusEffect{ID: "nadia-poison", Source: h.owner.ID, Kind: "poison", Until: now + 3, nextTick: now + 1, interval: 1, damage: 8})
 		}
-		if h.owner != nil && h.owner.Character == "Sophie" && h.owner.HP > 0 {
+		if h.owner != nil && h.owner.Character == "Sophie" && h.target.isChampion() && h.owner.HP > 0 {
 			h.owner.addStatus(statusEffect{ID: "sowing", Source: h.owner.ID, Kind: "speed", Until: now + 2, Value: 30})
 		}
 		if h.slow > 0 {
